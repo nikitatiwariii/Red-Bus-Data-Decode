@@ -1,0 +1,234 @@
+import pandas as pd
+import numpy as np
+import lightgbm as lgb
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from datetime import datetime, timedelta
+import holidays
+import warnings
+warnings.filterwarnings('ignore')
+import os
+import gc
+
+# =============================================================================
+# 1. FEATURE ENGINEERING (MODULARIZED)
+# =============================================================================
+def get_holidays_data():
+    """
+    Returns a dictionary of holiday sets for India using the holidays library.
+    """
+    print("Generating comprehensive holiday calendar...")
+    # Covering years relevant to the dataset plus a buffer
+    in_holidays = holidays.country_holidays('IN', years=[2022, 2023, 2024, 2025])
+    
+    # Define major festivals that influence travel over a 'week'
+    major_festival_names = ["Holi", "Diwali", "Dussehra", "Pongal", "Eid", "Makar Sankranti"]
+    
+    major_festivals = set()
+    for date, name in in_holidays.items():
+        if any(festival_name in name for festival_name in major_festival_names):
+            major_festivals.add(date)
+
+    return {
+        "all": set(in_holidays.keys()),
+        "major_festivals": major_festivals
+    }
+
+def engineer_features(df, transactions_df, all_holidays_data):
+    """
+    Modular function to engineer all features for a given dataset (train or test).
+    This approach is highly memory-efficient.
+    """
+    print(f"Engineering features for dataset with shape {df.shape}...")
+    df['route'] = df['srcid'].astype(str) + '_' + df['destid'].astype(str)
+
+    # --- Feature Creation (dbd == 15) ---
+    transactions_15d = transactions_df[transactions_df['dbd'] == 15].copy()
+    agg_features_15d = transactions_15d.groupby(['route', 'doj']).agg(
+        total_seats_booked_15d=('cumsum_seatcount', 'last'),
+        total_searches_15d=('cumsum_searchcount', 'last')
+    ).reset_index()
+    df = df.merge(agg_features_15d, on=['route', 'doj'], how='left')
+
+    # --- Route, Calendar, and Rolling Lag Features ---
+    df['route_freq'] = df['route'].map(transactions_df['route'].value_counts()).fillna(0)
+    avg_seat_rate = transactions_df.groupby('route')['cumsum_seatcount'].mean().to_dict()
+    df['avg_seat_rate_per_route'] = df['route'].map(avg_seat_rate).fillna(0)
+    
+    # --- Enhanced Holiday Features ---
+    all_holidays = all_holidays_data['all']
+    major_festivals = all_holidays_data['major_festivals']
+
+    # Add back the simple holiday and weekend flags
+    df['is_weekend'] = (df['doj'].dt.dayofweek >= 5).astype(int)
+    df['is_holiday'] = df['doj'].isin(all_holidays).astype(int)
+
+    # 1. is_festival_week
+    festival_week_dates = set()
+    for fest_date in major_festivals:
+        for i in range(-3, 4):  # 7-day window
+            festival_week_dates.add(fest_date + timedelta(days=i))
+    df['is_festival_week'] = df['doj'].isin(festival_week_dates).astype(int)
+
+    # 2. is_day_after_holiday
+    days_after_holidays = {h + timedelta(days=1) for h in all_holidays}
+    df['is_day_after_holiday'] = df['doj'].isin(days_after_holidays).astype(int)
+
+    # 3. days_to_holiday (efficiently calculated)
+    sorted_holidays = sorted(list(all_holidays))
+    holidays_df = pd.DataFrame({'holiday_date': sorted_holidays})
+    holidays_df['holiday_date'] = pd.to_datetime(holidays_df['holiday_date']) # Ensure dtype is correct
+    
+    # VERIFY DTYPE BEFORE MERGE
+    print(f"Verifying dtype before merge: df['doj'] is {df['doj'].dtype}, holidays_df['holiday_date'] is {holidays_df['holiday_date'].dtype}")
+
+    df = df.sort_values('doj')
+    df = pd.merge_asof(
+        df, holidays_df, left_on='doj', right_on='holiday_date', direction='forward'
+    )
+    df['days_to_holiday'] = (df['holiday_date'] - df['doj']).dt.days
+    df['days_to_holiday'].fillna(999, inplace=True) # High value if no future holiday found
+    df.drop(columns=['holiday_date'], inplace=True, errors='ignore')
+
+    # Yearly peak/seasonality feature
+    if 'doj' in transactions_df.columns:
+        transactions_df['year'] = transactions_df['doj'].dt.year
+        transactions_df['month'] = transactions_df['doj'].dt.month
+        monthly_avg = transactions_df.groupby(['route', 'year', 'month'])['cumsum_seatcount'].mean().reset_index()
+        peak_months = monthly_avg.loc[monthly_avg.groupby(['route', 'year'])['cumsum_seatcount'].idxmax()]
+        peak_months = peak_months[['route', 'year', 'month']].rename(columns={'month': 'peak_month'})
+        peak_months['year'] = peak_months['year'] + 1
+        
+        df['year'] = df['doj'].dt.year
+        df = df.merge(peak_months, on=['route', 'year'], how='left')
+        df['yearly_peak_tag'] = (df['doj'].dt.month == df['peak_month']).astype(int)
+        df.drop(columns=['peak_month', 'year'], inplace=True, errors='ignore')
+
+    # Search-to-book ratio
+    df['search_to_book_ratio'] = (df['total_seats_booked_15d'] / df['total_searches_15d']).fillna(0)
+    df['search_to_book_ratio'] = df['search_to_book_ratio'].replace([np.inf, -np.inf], 0)
+
+    # --- Outlier and Normalization will be handled in the modeling step ---
+    print("Feature engineering complete.")
+    return df
+
+# =============================================================================
+# 2. MODELING AND PREDICTION
+# =============================================================================
+def train_and_predict(train_df, test_df, transactions_df, all_holidays_data):
+    """Train model, apply corrections, and generate predictions"""
+    print("\nStep 2: Training model and generating predictions...")
+    
+    # Engineer features for train and test sets separately for memory efficiency
+    train_processed = engineer_features(train_df, transactions_df, all_holidays_data)
+    test_processed = engineer_features(test_df, transactions_df, all_holidays_data)
+    
+    exclude_cols = ['doj', 'final_seatcount', 'route', 'route_key']
+    feature_cols = [col for col in train_processed.columns if col not in exclude_cols]
+    
+    # --- Preprocessing ---
+    for col in [c for c in feature_cols if train_processed[c].dtype == 'object']:
+        le = LabelEncoder()
+        train_processed[col] = le.fit_transform(train_processed[col].astype(str))
+        test_processed[col] = le.transform(test_processed[col].astype(str))
+
+    train_processed.fillna(0, inplace=True)
+    test_processed.fillna(0, inplace=True)
+    
+    for col in ['total_seats_booked_15d', 'total_searches_15d', 'route_freq']:
+        p1 = train_processed[col].quantile(0.01)
+        p99 = train_processed[col].quantile(0.99)
+        train_processed[col] = np.clip(train_processed[col], p1, p99)
+        test_processed[col] = np.clip(test_processed[col], p1, p99)
+        
+    scaler = StandardScaler()
+    train_processed[feature_cols] = scaler.fit_transform(train_processed[feature_cols])
+    test_processed[feature_cols] = scaler.transform(test_processed[feature_cols])
+
+    X_train, y_train = train_processed[feature_cols], train_processed['final_seatcount']
+    X_test = test_processed[feature_cols]
+
+    # --- Model Training ---
+    params = {'objective': 'regression_l1', 'metric': 'rmse', 'n_estimators': 2000, 'learning_rate': 0.01, 'feature_fraction': 0.8, 'bagging_fraction': 0.8, 'bagging_freq': 1, 'lambda_l1': 0.1, 'lambda_l2': 0.1, 'num_leaves': 31, 'verbose': -1, 'n_jobs': -1, 'seed': 42}
+    model = lgb.LGBMRegressor(**params)
+    model.fit(X_train, y_train, eval_set=[(X_train, y_train)], callbacks=[lgb.early_stopping(50, verbose=False)])
+
+    # --- Post-Model Correction Layer ---
+    train_preds = model.predict(X_train)
+    train_residuals = y_train - train_preds
+    
+    holiday_residuals = train_residuals[train_processed['is_holiday'] == 1]
+    holiday_correction = holiday_residuals.mean() if not holiday_residuals.empty else 0.0
+    
+    weekend_residuals = train_residuals[train_processed['is_weekend'] == 1]
+    weekend_correction = weekend_residuals.mean() if not weekend_residuals.empty else 0.0
+
+    print(f"Applying corrections: Holiday={holiday_correction:.2f}, Weekend={weekend_correction:.2f}")
+    
+    predictions = model.predict(X_test)
+    predictions[test_processed['is_holiday'].to_numpy().astype(bool)] += holiday_correction
+    predictions[test_processed['is_weekend'].to_numpy().astype(bool)] += weekend_correction
+    predictions = np.maximum(0, predictions).round().astype(int)
+    
+    # --- Create Submission File ---
+    submission_df = pd.DataFrame({'route_key': test_df['route_key'], 'final_seatcount': predictions})
+    submission_df.to_csv('submission_final.csv', index=False)
+    
+    print("Final submission file created successfully.")
+    print(submission_df.head())
+
+# =============================================================================
+# MAIN PIPELINE
+# =============================================================================
+def main():
+    """Run the complete final data science pipeline"""
+    print("--- Starting Final Forecasting Pipeline (Memory-Safe) ---")
+    
+    # Load raw data
+    train_df = pd.read_csv('train/train.csv')
+    test_df = pd.read_csv('test_8gqdJqH.csv')
+    transactions_df = pd.read_csv('train/transactions.csv')
+    
+    # --- Centralized Data Type Conversion ---
+    print("Converting date columns to datetime objects...")
+    for df in [train_df, test_df, transactions_df]:
+        for col in ['doj', 'doi']:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors='coerce')
+    
+    # Get holiday data once
+    all_holidays_data = get_holidays_data()
+    
+    # Create route column before concatenation
+    train_df['route'] = train_df['srcid'].astype(str) + '_' + train_df['destid'].astype(str)
+    test_df['route'] = test_df['srcid'].astype(str) + '_' + test_df['destid'].astype(str)
+    
+    # Ensure 'route' column exists in transactions_df before use
+    transactions_df['route'] = transactions_df['srcid'].astype(str) + '_' + transactions_df['destid'].astype(str)
+
+    # --- Calculate Weekday Lag Feature ---
+    print("Calculating temporal lag features...")
+    full_data = pd.concat([train_df, test_df], ignore_index=True, sort=False)
+    full_data.sort_values(['route', 'doj'], inplace=True)
+    full_data['weekday'] = full_data['doj'].dt.weekday
+    
+    lag1 = full_data.groupby(['route', 'weekday'])['final_seatcount'].shift(1)
+    lag2 = full_data.groupby(['route', 'weekday'])['final_seatcount'].shift(2)
+    lag3 = full_data.groupby(['route', 'weekday'])['final_seatcount'].shift(3)
+    
+    full_data['avg_seats_last_3_same_weekday'] = pd.concat([lag1, lag2, lag3], axis=1).mean(axis=1)
+    
+    # Split back into train and test
+    train_df = full_data[full_data['final_seatcount'].notna()].copy()
+    test_df = full_data[full_data['final_seatcount'].isna()].copy()
+    
+    del full_data, lag1, lag2, lag3
+    gc.collect()
+    
+    # Run the modeling and prediction pipeline
+    train_and_predict(train_df, test_df, transactions_df, all_holidays_data)
+    
+    gc.collect()
+    print("\n--- Final Pipeline Completed Successfully! ---")
+
+if __name__ == "__main__":
+    main() 
